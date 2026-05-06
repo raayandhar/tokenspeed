@@ -1,0 +1,67 @@
+"""DeepSeek V4 attention CUDA kernel wrappers."""
+
+from __future__ import annotations
+
+import functools
+from pathlib import Path
+
+import torch
+import tvm_ffi
+
+
+def _objs_dir() -> Path:
+    return Path(__file__).resolve().parent / "objs"
+
+
+@functools.cache
+def _load_deepseek_v4_attention_module():
+    so_path = _objs_dir() / "deepseek_v4_attention" / "deepseek_v4_attention.so"
+    if not so_path.exists():
+        raise RuntimeError(
+            f"tokenspeed_kernel DeepSeek V4 attention library not found at {so_path}. "
+            "Run `pip install -e tokenspeed-kernel/python/` to build."
+        )
+    return tvm_ffi.load_module(str(so_path))
+
+
+def has_fused_qnorm_rope_kv_insert() -> bool:
+    try:
+        _load_deepseek_v4_attention_module()
+    except Exception:
+        return False
+    return True
+
+
+def fused_qnorm_rope_kv_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rms_norm_eps: float,
+    block_size: int,
+) -> None:
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(f"q must be float16 or bfloat16, got {q.dtype}")
+    if kv.dtype != q.dtype:
+        raise TypeError(f"kv dtype {kv.dtype} must match q dtype {q.dtype}")
+    if k_cache.dtype != torch.uint8:
+        raise TypeError(f"k_cache must be uint8, got {k_cache.dtype}")
+    if cos_sin_cache.dtype != torch.float32:
+        raise TypeError(f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}")
+    if slot_mapping.dtype != torch.int64:
+        slot_mapping = slot_mapping.to(torch.int64)
+    if positions.dtype != torch.int64:
+        positions = positions.to(torch.int64)
+
+    _load_deepseek_v4_attention_module().fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q,
+        kv,
+        k_cache,
+        slot_mapping.contiguous(),
+        positions.contiguous(),
+        cos_sin_cache.contiguous(),
+        float(rms_norm_eps),
+        int(block_size),
+    )

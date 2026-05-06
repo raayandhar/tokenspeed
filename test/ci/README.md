@@ -1,0 +1,34 @@
+# CI Task Specs
+
+`test/ci/` is the source of truth for CI task declarations consumed by
+`test/ci_system/pipeline.py`.
+
+Current trigger values:
+
+- `per-commit`
+- `manual`
+- `nightly`
+
+Supported task types:
+
+- `ut`
+- `server_smoke`
+- `eval`
+- `perf`
+
+Currently configured task directories:
+
+- `eval`
+- `ut`
+
+Each task expands into one matrix entry per runner label.
+`b200-<Ngpu>` labels are the default B200 runners. Set the
+`TOKENSPEED_B200_RUNNER_LABEL` repository variable in GitHub Actions
+(`Settings` -> `Secrets and variables` -> `Actions` -> `Variables`) to a
+non-empty runner family such as `b200v2` to temporarily route them to
+`b200v2-<Ngpu>` without editing task YAML. Leave the variable unset or empty to
+use the default `b200-<Ngpu>` labels.
+The CI system derives `SM` from common runner label prefixes by default:
+`h100`/`h200` use `sm90`, `b200`/`gb200` use `sm100`, and `b300`/`gb300` use
+`sm103`. Use `runner.env.<label>` only for environment variables that should
+override or extend the defaults for a single runner label.

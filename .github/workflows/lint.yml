@@ -1,0 +1,74 @@
+name: Lint
+
+on: [pull_request]
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install pre-commit hook
+        run: |
+          python -m pip install pre-commit ruff nanobind
+          pre-commit install
+
+      - name: Linting
+        run: pre-commit run --all-files
+
+      - name: Install scheduler C++ lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format clang-tidy cmake ninja-build
+
+      - name: Configure scheduler compile database
+        run: |
+          cmake -S tokenspeed-scheduler -B tokenspeed-scheduler/build \
+            -G Ninja \
+            -DTOKENSPEED_SCHEDULER_BUILD_TESTS=ON \
+            -DTOKENSPEED_SCHEDULER_BUILD_PYTHON=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Lint scheduler Python and file starts
+        run: |
+          python -m ruff check tokenspeed-scheduler
+          python - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          suffixes = {".py", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+          files = subprocess.check_output(["git", "ls-files", "tokenspeed-scheduler"], text=True).splitlines()
+          blank_starts = []
+          relative_imports = []
+          for name in files:
+              path = Path(name)
+              if path.suffix in suffixes and path.read_bytes().startswith((b"\n", b"\r\n")):
+                  blank_starts.append(name)
+              if path.suffix == ".py":
+                  for line_no, line in enumerate(path.read_text().splitlines(), 1):
+                      if line.startswith(("from .", "import .")):
+                          relative_imports.append(f"{name}:{line_no}: {line}")
+
+          errors = []
+          if blank_starts:
+              errors.append("files must not start with a blank line:\n" + "\n".join(blank_starts))
+          if relative_imports:
+              errors.append("scheduler Python must use absolute imports:\n" + "\n".join(relative_imports))
+          if errors:
+              raise SystemExit("\n\n".join(errors))
+          PY
+
+      - name: Lint scheduler C++
+        run: |
+          cpp_files="$(git ls-files tokenspeed-scheduler | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$')"
+          printf '%s\n' "$cpp_files" | xargs clang-format --dry-run --Werror
+          printf '%s\n' "$cpp_files" | grep -E '\.(c|cc|cpp|cxx)$' | xargs clang-tidy -p tokenspeed-scheduler/build

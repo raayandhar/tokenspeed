@@ -1,0 +1,39 @@
+name: Scheduler Python Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tokenspeed-scheduler/**"
+      - ".github/workflows/scheduler-python-test.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "tokenspeed-scheduler/**"
+      - ".github/workflows/scheduler-python-test.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: scheduler-python-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          python -m pip install -e 'tokenspeed-scheduler[test]'
+
+      - name: Run scheduler Python tests
+        run: python -m pytest tokenspeed-scheduler/python/tests
