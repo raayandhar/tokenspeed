@@ -62,6 +62,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
+from tokenspeed.runtime.metrics.collector import EngineMetrics
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.factory import (
     create_pd_kv_transfer,
@@ -296,6 +297,19 @@ class EventLoop:
 
         self._init_interprocess_comm()
 
+        self.metrics = EngineMetrics(
+            labels={
+                "model_name": server_args.served_model_name,
+                "app_key": server_args.app_key or "",
+                "dp_rank": str(dp_rank),
+            },
+            enabled=(
+                server_args.enable_metrics
+                and attn_tp_rank == 0
+                and "prometheus" in (server_args.metrics_reporters or [])
+            ),
+        )
+
         self.request_handler = RequestHandler(
             server_args=self.server_args,
             hf_eos_token_id=self.model_config.hf_eos_token_id,
@@ -317,6 +331,7 @@ class EventLoop:
                 else None
             ),
             stream_interval=self.server_args.stream_interval,
+            metrics=self.metrics,
         )
         self.prefetch_threshold = scheduler_cfg.prefetch_threshold
 
@@ -851,6 +866,17 @@ class EventLoop:
             "num_queue_reqs": self.scheduler.waiting_size(),
         }
 
+    def _record_scheduler_iteration_metrics(
+        self, stats: dict, num_iteration_tokens: int
+    ) -> None:
+        self.metrics.record_scheduler_iteration(
+            running=len(self.output_processor.rid_to_state),
+            waiting=stats["num_queue_reqs"],
+            num_active_pages=stats["num_active_pages"],
+            num_total_pages=self.max_total_num_tokens // self.server_args.block_size,
+            num_iteration_tokens=num_iteration_tokens,
+        )
+
     # ------------------------------------------------------------------
     # Event loops
     # ------------------------------------------------------------------
@@ -865,6 +891,11 @@ class EventLoop:
 
             forward_op = self._get_forward_op(execution_plan)
 
+            stats = self._get_scheduler_stats()
+            num_iter_tokens = (
+                sum(forward_op.input_lengths) if forward_op is not None else 0
+            )
+
             # DP sync: all ranks must participate even when idle.
             dp_metadata = None
             if self.has_dp:
@@ -875,12 +906,12 @@ class EventLoop:
                         dp_metadata.global_batch_size,
                         dp_metadata.all_decode_or_idle,
                     )
+                    self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
                     continue
 
             request_changes = []
 
             if forward_op is not None:
-                stats = self._get_scheduler_stats()
                 sampling_params_list = self._gather_sampling_params(forward_op)
                 grammar_inputs = self._gather_grammar_state(forward_op)
                 results, on_first_token = self._dispatch_forward(
@@ -904,6 +935,8 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+
+            self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The
@@ -969,6 +1002,12 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+
+            stats = self._get_scheduler_stats()
+            num_iter_tokens = (
+                sum(forward_op.input_lengths) if forward_op is not None else 0
+            )
+
             grammar_inputs = None
             if forward_op is not None:
                 # Gather both sampling params and grammar state BEFORE the
@@ -996,6 +1035,7 @@ class EventLoop:
                         dp_metadata.global_batch_size,
                         dp_metadata.all_decode_or_idle,
                     )
+                    self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
                     continue
 
             # ---- dispatch current forward first (async GPU launch) ----
@@ -1035,7 +1075,6 @@ class EventLoop:
                     # working state before this decode mutates the same slot;
                     # the snapshot helper only copies block-aligned states.
                     self.model_executor.snapshot_mamba_checkpoints_for_op(forward_op)
-                stats = self._get_scheduler_stats()
                 curr_results, _ = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
@@ -1058,6 +1097,8 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+
+            self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
             prev_results = curr_results
             prev_forward_op = forward_op
